@@ -5,6 +5,7 @@ double-clicking this file. Files and folders can also be dragged onto the list.
 Rows can be dragged to reorder; the merge itself lives in pdfmerge_core.py.
 """
 import ctypes
+import ctypes.wintypes
 import os
 import queue
 import sys
@@ -24,9 +25,16 @@ try:
 except ImportError:
     TkinterDnD = None
 
-FONT = ("Leelawadee UI", 10)
-PREVIEW_W, PREVIEW_H = 240, 320
-RENDER_LONG_SIDE = 700  # px rendered before shrinking into the preview
+FONT_FAMILY = "Leelawadee UI"
+# The layout was designed at BASE_W x BASE_H px with 10 pt text on a 125%
+# (120-dpi) screen; every font and size is multiplied by a zoom factor that
+# follows the window size, so text keeps the same proportion to the window.
+BASE_W, BASE_H = 920, 580
+DESIGN_DPI_SCALE = 1.25
+START_ZOOM = 2.0        # first open at twice the design size, if the screen allows
+MIN_ZOOM, MAX_ZOOM = 0.85, 3.0
+PREVIEW_W, PREVIEW_H = 240, 320  # preview box at zoom 1
+RENDER_LONG_SIDE = 700  # min px rendered before shrinking into the preview
 
 
 def app_dir():
@@ -47,7 +55,14 @@ def short_path(path):
     return os.path.join(folder, os.path.basename(path)) if folder else path
 
 
-def render_source(path, rotation):
+def work_area():
+    """(x, y, w, h) of the primary monitor minus the taskbar, in physical px."""
+    r = ctypes.wintypes.RECT()
+    ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(r), 0)  # SPI_GETWORKAREA
+    return r.left, r.top, r.right - r.left, r.bottom - r.top
+
+
+def render_source(path, rotation, long_side):
     """First page of a PDF or an image, upright, rotated clockwise, as RGB."""
     if core.kind_of(path) == "pdf":
         import pypdfium2 as pdfium
@@ -55,7 +70,7 @@ def render_source(path, rotation):
         try:
             pdf.init_forms()  # so filled-in form fields show in the preview
             page = pdf[0]
-            scale = RENDER_LONG_SIDE / max(page.get_width(), page.get_height())
+            scale = long_side / max(page.get_width(), page.get_height())
             img = page.render(scale=scale).to_pil().convert("RGB")
             page.close()
         finally:
@@ -63,7 +78,7 @@ def render_source(path, rotation):
     else:
         img = Image.open(path)
         if img.format == "JPEG":
-            img.draft("RGB", (RENDER_LONG_SIDE * 2, RENDER_LONG_SIDE * 2))
+            img.draft("RGB", (long_side * 2, long_side * 2))
         img = ImageOps.exif_transpose(img)
         if img.mode in ("RGBA", "LA", "P"):
             rgba = img.convert("RGBA")
@@ -76,13 +91,12 @@ def render_source(path, rotation):
     return img
 
 
-def make_preview(path, rotation, landscape_ok):
-    """The source drawn on an A4 sheet, as it will come out of the merge."""
-    img = render_source(path, rotation)
+def make_preview(img, landscape_ok, box_w, box_h):
+    """`img` drawn on an A4 sheet that fits box_w x box_h, as the merge will lay it out."""
     if landscape_ok and img.width > img.height:
-        pw, ph = PREVIEW_W, round(PREVIEW_W * core.A4_W / core.A4_H)
+        pw, ph = box_w, round(box_w * core.A4_W / core.A4_H)
     else:
-        pw, ph = round(PREVIEW_H * core.A4_W / core.A4_H), PREVIEW_H
+        pw, ph = round(box_h * core.A4_W / core.A4_H), box_h
     sheet = Image.new("RGB", (pw, ph), "white")
     img = ImageOps.contain(img, (pw, ph), Image.LANCZOS)
     sheet.paste(img, ((pw - img.width) // 2, (ph - img.height) // 2))
@@ -97,32 +111,83 @@ class App:
         self.busy = False
         self._drag = None
         self._photo = None
+        self._src = (None, None)  # (key, rendered first page) so resizing doesn't re-render
+        self.dpi = root.winfo_fpixels("1i") / 96.0   # 1.25 on a 125% screen
+        self.ui = self.dpi / DESIGN_DPI_SCALE         # design px -> screen px at zoom 1
+        self.zoom = None
+        self._zoom_job = None
 
         root.title(f"รวม PDF เป็น A4 · v{core.__version__}")
         if os.path.exists(resource("pdfmerge.ico")):
             root.iconbitmap(default=resource("pdfmerge.ico"))
-        root.geometry("920x580")
-        root.minsize(760, 460)
         self._build()
+        self.apply_zoom(self._place_window())
+        root.bind("<Configure>", self._on_configure)
         self.add_files(sorted(initial, key=core.natural_key))
+
+    # ---------- window size & zoom ----------
+    def _place_window(self):
+        """Open at START_ZOOM x the design size, shrunk to fit the screen; returns the zoom."""
+        x0, y0, ww, wh = work_area()
+        bw, bh = BASE_W * self.ui, BASE_H * self.ui
+        title_bar = 40 * self.dpi
+        z = max(1.0, min(START_ZOOM, (ww - 16 * self.dpi) / bw, (wh - title_bar) / bh))
+        w, h = round(bw * z), round(bh * z)
+        y = y0 + max(0, round((wh - title_bar - h) / 2))
+        self.root.geometry(f"{w}x{h}+{x0 + (ww - w) // 2}+{y}")
+        self.root.minsize(round(bw * MIN_ZOOM), round(bh * MIN_ZOOM))
+        return z
+
+    def _on_configure(self, event):
+        if event.widget is self.root:
+            if self._zoom_job:
+                self.root.after_cancel(self._zoom_job)
+            self._zoom_job = self.root.after(120, self._zoom_to_window)
+
+    def _zoom_to_window(self):
+        self._zoom_job = None
+        z = min(self.root.winfo_width() / (BASE_W * self.ui),
+                self.root.winfo_height() / (BASE_H * self.ui))
+        z = max(MIN_ZOOM, min(MAX_ZOOM, z))
+        if self.zoom is None or abs(z - self.zoom) > 0.02:
+            self.apply_zoom(z)
+
+    def px(self, v):
+        """Design px -> screen px at the current zoom."""
+        return max(1, round(v * self.ui * self.zoom))
+
+    def apply_zoom(self, z):
+        self.zoom = z
+        pt = lambda size: max(7, round(size * z))
+        for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont"):
+            tkfont.nametofont(name).configure(family=FONT_FAMILY, size=pt(10))
+        style = ttk.Style()
+        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        style.configure("Treeview", rowheight=line + self.px(10))
+        style.configure("Big.TButton", font=(FONT_FAMILY, pt(11), "bold"),
+                        padding=(self.px(14), self.px(8)))
+        self.empty_hint.configure(font=(FONT_FAMILY, pt(13)))
+        for col, w in (("no", 40), ("name", 240), ("pages", 56), ("rot", 60)):
+            self.tree.column(col, width=self.px(w))
+        self.preview_box.configure(width=self.px(PREVIEW_W) + 4, height=self.px(PREVIEW_H) + 4)
+        self.hint.pack_configure(padx=self.px(12), pady=(self.px(10), self.px(4)))
+        self.mid.pack_configure(padx=self.px(12))
+        self.btns.pack_configure(padx=self.px(10))
+        self.bottom.pack_configure(padx=self.px(12), pady=self.px(10))
+        self.status.pack_configure(padx=self.px(16))
+        self.update_preview()
 
     # ---------- layout ----------
     def _build(self):
         root = self.root
-        for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont"):
-            tkfont.nametofont(name).configure(family=FONT[0], size=FONT[1])
-        style = ttk.Style()
-        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-        style.configure("Treeview", rowheight=line + 10)
-        style.configure("Big.TButton", font=(FONT[0], 11, "bold"), padding=(14, 8))
+        self.hint = hint = ttk.Label(
+            root, foreground="#555",
+            text="ลากไฟล์ PDF / รูป มาวางที่รายการได้ · ลากแถวเพื่อสลับลำดับ · "
+                 "ทุกหน้าจะถูกปรับเป็น A4 โดยไม่ตัดขอบ")
+        hint.pack(fill="x")
 
-        hint = ttk.Label(root, foreground="#555",
-                         text="ลากไฟล์ PDF / รูป มาวางที่รายการได้ · ลากแถวเพื่อสลับลำดับ · "
-                              "ทุกหน้าจะถูกปรับเป็น A4 โดยไม่ตัดขอบ")
-        hint.pack(fill="x", padx=12, pady=(10, 4))
-
-        mid = ttk.Frame(root)
-        mid.pack(fill="both", expand=True, padx=12)
+        self.mid = mid = ttk.Frame(root)
+        mid.pack(fill="both", expand=True)
 
         # file list
         listf = ttk.Frame(mid)
@@ -134,19 +199,19 @@ class App:
                 ("pages", "หน้า", 56, "center", False),
                 ("rot", "หมุน", 60, "center", False)):
             self.tree.heading(c, text=text)
-            self.tree.column(c, width=w, anchor=anchor, stretch=stretch)
+            self.tree.column(c, width=w, minwidth=20, anchor=anchor, stretch=stretch)
         sb = ttk.Scrollbar(listf, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="left", fill="y")
         # shown over the empty list; clicking it opens the file picker
         self.empty_hint = tk.Label(self.tree, bg="white", fg="#8a8a8a", cursor="hand2",
-                                   font=(FONT[0], 13), justify="center",
+                                   justify="center",
                                    text="ลากไฟล์ PDF / รูป มาวางที่นี่\n\nหรือคลิกตรงนี้เพื่อเลือกไฟล์")
         self.empty_hint.bind("<Button-1>", lambda e: self.browse())
 
         # buttons
-        btns = ttk.Frame(mid)
+        self.btns = btns = ttk.Frame(mid)
         for text, cmd in (("▲  ขึ้น", lambda: self.move(-1)),
                           ("▼  ลง", lambda: self.move(1)),
                           ("↻  หมุน 90°", self.rotate),
@@ -167,7 +232,7 @@ class App:
 
         # preview: fixed box so portrait/landscape previews don't shift the layout
         pv = ttk.Frame(mid)
-        box =ttk.Frame(pv, width=PREVIEW_W + 4, height=PREVIEW_H + 4)
+        self.preview_box = box = ttk.Frame(pv)
         box.pack_propagate(False)
         box.pack(pady=(0, 4))
         self.preview = ttk.Label(box, anchor="n")
@@ -177,12 +242,12 @@ class App:
 
         # pack right-hand panels first so a narrow window squeezes the list, not the preview
         pv.pack(side="right", fill="y")
-        btns.pack(side="right", fill="y", padx=10)
+        btns.pack(side="right", fill="y")
         listf.pack(side="left", fill="both", expand=True)
 
         # bottom bar
-        bottom = ttk.Frame(root)
-        bottom.pack(fill="x", padx=12, pady=10)
+        self.bottom = bottom = ttk.Frame(root)
+        bottom.pack(fill="x")
         self.landscape = tk.BooleanVar(value=True)
         ttk.Checkbutton(bottom, text="หน้าแนวนอนใช้ A4 แนวนอน",
                         variable=self.landscape, command=self.update_preview).pack(side="left")
@@ -190,7 +255,7 @@ class App:
                                     command=self.merge)
         self.merge_btn.pack(side="right")
         self.status = ttk.Label(bottom, foreground="#333")
-        self.status.pack(side="left", padx=16, fill="x", expand=True)
+        self.status.pack(side="left", fill="x", expand=True)
 
         # events
         self.tree.bind("<<TreeviewSelect>>", lambda e: self.on_select())
@@ -377,8 +442,13 @@ class App:
             self.preview_cap.configure(text="")
             return
         it = self.items[sel[0]]
+        box_w, box_h = self.px(PREVIEW_W), self.px(PREVIEW_H)
         try:
-            img = make_preview(it["path"], it["rot"], self.landscape.get())
+            long_side = max(RENDER_LONG_SIDE, round(box_h * 1.25))
+            key = (it["path"], it["rot"], long_side)
+            if self._src[0] != key:
+                self._src = (key, render_source(it["path"], it["rot"], long_side))
+            img = make_preview(self._src[1], self.landscape.get(), box_w, box_h)
             self._photo = ImageTk.PhotoImage(img)
             self.preview.configure(image=self._photo)
             cap = "ตัวอย่างหน้าแรก" if it["pages"] == 1 else f"ตัวอย่างหน้า 1 จาก {it['pages']}"

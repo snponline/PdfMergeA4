@@ -14,7 +14,7 @@ import sys
 from PIL import Image, ImageOps
 from pypdf import PdfReader, PdfWriter, Transformation
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 A4_W, A4_H = 595.276, 841.890  # points (210 x 297 mm)
 IMG_MAX_SIDE = 3000             # px; ~250 dpi on A4, keeps phone photos small
