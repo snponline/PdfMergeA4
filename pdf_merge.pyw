@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes
 import os
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -35,6 +36,11 @@ START_ZOOM = 2.0        # first open at twice the design size, if the screen all
 MIN_ZOOM, MAX_ZOOM = 0.85, 3.0
 PREVIEW_W, PREVIEW_H = 240, 320  # preview box at zoom 1
 RENDER_LONG_SIDE = 700  # min px rendered before shrinking into the preview
+
+# output formats: (core key, dropdown label, merge-button text, file extension)
+FORMATS = (("pdf", "PDF (ไฟล์เดียว)", "รวมเป็น PDF (A4)…", ".pdf"),
+           ("jpg", "JPG แยกหน้า (A4)", "บันทึกเป็น JPG (A4)…", ".jpg"),
+           ("long", "JPG รูปยาว", "บันทึกเป็นรูปยาว…", ".jpg"))
 
 
 def app_dir():
@@ -166,6 +172,8 @@ class App:
         style.configure("Treeview", rowheight=line + self.px(10))
         style.configure("Big.TButton", font=(FONT_FAMILY, pt(11), "bold"),
                         padding=(self.px(14), self.px(8)))
+        # room above/below for Thai vowel and tone marks
+        style.configure("TCombobox", padding=(self.px(6), self.px(4), self.px(2), self.px(4)))
         self.empty_hint.configure(font=(FONT_FAMILY, pt(13)))
         for col, w in (("no", 40), ("name", 240), ("pages", 56), ("rot", 60)):
             self.tree.column(col, width=self.px(w))
@@ -174,7 +182,16 @@ class App:
         self.mid.pack_configure(padx=self.px(12))
         self.btns.pack_configure(padx=self.px(10))
         self.bottom.pack_configure(padx=self.px(12), pady=self.px(10))
+        self.fmt_label.pack_configure(padx=(self.px(24), self.px(6)))
         self.status.pack_configure(padx=self.px(16))
+        # the combobox's drop-down list is a separate Tk listbox with its own font
+        list_font = (FONT_FAMILY, pt(10))
+        self.root.option_add("*TCombobox*Listbox.font", list_font)
+        try:
+            popdown = self.root.tk.call("ttk::combobox::PopdownWindow", self.fmt_box)
+            self.root.tk.call(f"{popdown}.f.l", "configure", "-font", list_font)
+        except tk.TclError:
+            pass
         self.update_preview()
 
     # ---------- layout ----------
@@ -251,7 +268,14 @@ class App:
         self.landscape = tk.BooleanVar(value=True)
         ttk.Checkbutton(bottom, text="หน้าแนวนอนใช้ A4 แนวนอน",
                         variable=self.landscape, command=self.update_preview).pack(side="left")
-        self.merge_btn = ttk.Button(bottom, text="รวมเป็น PDF (A4)…", style="Big.TButton",
+        self.fmt_label = ttk.Label(bottom, text="บันทึกเป็น:")
+        self.fmt_label.pack(side="left")
+        self.fmt_var = tk.StringVar(value=FORMATS[0][1])
+        self.fmt_box = ttk.Combobox(bottom, textvariable=self.fmt_var, state="readonly",
+                                    values=[f[1] for f in FORMATS], width=16)
+        self.fmt_box.pack(side="left")
+        self.fmt_box.bind("<<ComboboxSelected>>", lambda e: self.on_format())
+        self.merge_btn = ttk.Button(bottom, text=FORMATS[0][2], style="Big.TButton",
                                     command=self.merge)
         self.merge_btn.pack(side="right")
         self.status = ttk.Label(bottom, foreground="#333")
@@ -458,33 +482,51 @@ class App:
         self.preview_cap.configure(text=cap)
 
     # ---------- merge ----------
+    def current_format(self):
+        """(key, label, button text, extension) of the format picked in the dropdown."""
+        return next(f for f in FORMATS if f[1] == self.fmt_var.get())
+
+    def on_format(self):
+        self.merge_btn.configure(text=self.current_format()[2])
+        self.fmt_box.selection_clear()
+
     def merge(self):
         order = self.order()
         if not order:
             messagebox.showinfo("รวม PDF", "ยังไม่มีไฟล์ในรายการ", parent=self.root)
             return
+        fmt, _, _, ext = self.current_format()
         first = self.items[order[0]]["path"]
         out = filedialog.asksaveasfilename(
             parent=self.root, title="บันทึกไฟล์ที่รวมแล้ว",
             initialdir=os.path.dirname(first),
-            initialfile="รวม_" + os.path.splitext(os.path.basename(first))[0] + ".pdf",
-            defaultextension=".pdf", filetypes=[("PDF", "*.pdf")])
+            initialfile="รวม_" + os.path.splitext(os.path.basename(first))[0] + ext,
+            defaultextension=ext,
+            filetypes=[("PDF", "*.pdf")] if fmt == "pdf" else [("JPG", "*.jpg;*.jpeg")])
         if not out:
             return
+        if fmt == "jpg":
+            # the save dialog only asked about name.jpg; pages become name_1.jpg, name_2.jpg …
+            pages = sum(self.items[i]["pages"] for i in order)
+            existing = [p for p in core.jpg_page_paths(out, pages) if os.path.exists(p)]
+            if pages > 1 and existing and not messagebox.askyesno(
+                    "มีไฟล์ชื่อนี้อยู่แล้ว",
+                    f"มีไฟล์ชื่อซ้ำอยู่แล้ว {len(existing)} ไฟล์ เช่น\n"
+                    f"{os.path.basename(existing[0])}\n\nบันทึกทับไหม?", parent=self.root):
+                return
         items = [(self.items[i]["path"], self.items[i]["rot"]) for i in order]
         self.busy = True
         self.merge_btn.configure(state="disabled")
         self.root.configure(cursor="watch")
-        threading.Thread(target=self._worker, args=(items, out, self.landscape.get()),
+        threading.Thread(target=self._worker, args=(items, out, fmt, self.landscape.get()),
                          daemon=True).start()
         self.root.after(100, self._poll)
 
-    def _worker(self, items, out, landscape):
-        def progress(n, total, path):
-            self.q.put(("progress", f"กำลังรวม {n}/{total}: {os.path.basename(path)}"))
+    def _worker(self, items, out, fmt, landscape):
         try:
-            pages = core.merge_to_a4(items, out, landscape, progress)
-            self.q.put(("done", pages, out))
+            pages, files = core.merge(items, out, fmt, landscape,
+                                      progress=lambda msg: self.q.put(("progress", msg)))
+            self.q.put(("done", fmt, pages, files))
         except PermissionError:
             self.q.put(("error", "บันทึกไม่ได้ — ไฟล์ปลายทางอาจเปิดค้างอยู่ในโปรแกรมอื่น\n"
                                  "ปิดไฟล์นั้นแล้วลองใหม่ หรือบันทึกเป็นชื่ออื่น"))
@@ -503,18 +545,33 @@ class App:
                 self.root.configure(cursor="")
                 self.refresh_rows()
                 if msg[0] == "done":
-                    _, pages, out = msg
-                    self.status.configure(text="บันทึกแล้ว: " + short_path(out))
-                    if messagebox.askyesno("รวมเสร็จแล้ว",
-                                           f"รวมเสร็จแล้ว {pages} หน้า (A4)\n\n{out}\n\nเปิดไฟล์เลยไหม?",
-                                           parent=self.root):
-                        os.startfile(out)
+                    self._report_done(*msg[1:])
                 else:
                     messagebox.showerror("รวมไม่สำเร็จ", msg[1], parent=self.root)
                 return
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
+
+    def _report_done(self, fmt, pages, files):
+        first = files[0]
+        if fmt == "jpg" and len(files) > 1:
+            self.status.configure(text=f"บันทึกแล้ว: {short_path(first)} และอีก {len(files) - 1} ไฟล์")
+            if messagebox.askyesno(
+                    "บันทึกเสร็จแล้ว",
+                    f"บันทึกเป็น JPG แล้ว {len(files)} ไฟล์ (หน้าละ 1 ไฟล์ ขนาด A4)\n\n"
+                    f"{os.path.dirname(first)}\n"
+                    f"{os.path.basename(first)} … {os.path.basename(files[-1])}\n\n"
+                    "เปิดโฟลเดอร์เลยไหม?", parent=self.root):
+                subprocess.Popen(["explorer", "/select,", first])
+            return
+        self.status.configure(text="บันทึกแล้ว: " + short_path(first))
+        done = {"pdf": f"รวมเสร็จแล้ว {pages} หน้า (A4)",
+                "jpg": "บันทึกเป็น JPG แล้ว (A4)",
+                "long": f"บันทึกรูปยาวแล้ว ({pages} หน้าต่อกัน)"}[fmt]
+        if messagebox.askyesno("บันทึกเสร็จแล้ว", f"{done}\n\n{first}\n\nเปิดไฟล์เลยไหม?",
+                               parent=self.root):
+            os.startfile(first)
 
 
 def make_root():
@@ -527,11 +584,15 @@ def make_root():
 
 
 def main():
-    # headless: PdfMergeA4.exe --out result.pdf a.pdf b.jpg ...  (exit code 1 on error)
+    # headless: PdfMergeA4.exe --out result.pdf|result.jpg [--long] a.pdf b.jpg ...
+    # (.jpg = one JPG per page, --long = one tall JPG; exit code 1 on error)
     if len(sys.argv) > 2 and sys.argv[1] == "--out":
         try:
-            files, _ = core.expand_paths(sys.argv[3:])
-            core.merge_to_a4([(f, 0) for f in files], sys.argv[2])
+            out, args = sys.argv[2], sys.argv[3:]
+            fmt = ("long" if "--long" in args else
+                   "jpg" if out.lower().endswith((".jpg", ".jpeg")) else "pdf")
+            files, _ = core.expand_paths([a for a in args if a != "--long"])
+            core.merge([(f, 0) for f in files], out, fmt)
         except Exception:
             log_crash(show=False)
             sys.exit(1)
